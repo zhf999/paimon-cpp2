@@ -257,7 +257,7 @@ Status PrefetchFileBatchReaderImpl::CleanUp() {
                 std::optional<PrefetchBatch> batch = prefetch_queue->try_pop();
                 {
                     std::unique_lock<std::mutex> lock(working_mutex_);
-                    cv_.notify_one();
+                    cv_.notify_all();
                 }
                 if (batch == std::nullopt) {
                     break;
@@ -270,7 +270,7 @@ Status PrefetchFileBatchReaderImpl::CleanUp() {
     {
         std::unique_lock<std::mutex> lock(working_mutex_);
         is_shutdown_ = true;  // set is shutdown and check shutdown to avoid block at queue.push
-        cv_.notify_one();
+        cv_.notify_all();
     }
     // Join and reset the background thread if it exists
     if (background_thread_) {
@@ -395,12 +395,21 @@ void PrefetchFileBatchReaderImpl::Workloop() {
         }
     }
     Wait(futures);
+    // The producer is stopping (all readers finished, shutdown, or an error was set before/inside
+    // the loop). Wake the consumer so it never blocks on cv_ after the Workloop has exited.
+    {
+        std::unique_lock<std::mutex> lock(working_mutex_);
+        cv_.notify_all();
+    }
 }
 
 void PrefetchFileBatchReaderImpl::ReadBatch(size_t reader_idx) {
     Status status = DoReadBatch(reader_idx);
     if (!status.ok()) {
         SetReadStatus(status);
+        // Wake the consumer so it observes the error instead of blocking on cv_ forever.
+        std::unique_lock<std::mutex> lock(working_mutex_);
+        cv_.notify_all();
     }
 }
 
@@ -521,7 +530,9 @@ Status PrefetchFileBatchReaderImpl::DoReadBatch(size_t reader_idx) {
     ScopeGuard guard([&]() {
         std::unique_lock<std::mutex> lock(working_mutex_);
         reader_is_working_[reader_idx] = false;
-        cv_.notify_one();
+        // notify_all because both the background Workloop and the consumer in
+        // NextBatchWithBitmap wait on cv_; a produced batch (or a finished reader) must wake both.
+        cv_.notify_all();
     });
     {
         std::unique_lock<std::mutex> lock(working_mutex_);
@@ -582,7 +593,7 @@ Result<BatchReader::ReadBatchWithBitmap> PrefetchFileBatchReaderImpl::NextBatchW
                 auto prefetch_batch = prefetch_queue->try_pop();
                 {
                     std::unique_lock<std::mutex> lock(working_mutex_);
-                    cv_.notify_one();
+                    cv_.notify_all();
                 }
                 current_batch_global_row_ids_ = std::move(prefetch_batch.value().global_row_ids);
                 return std::move(prefetch_batch).value().batch;
@@ -610,7 +621,22 @@ Result<BatchReader::ReadBatchWithBitmap> PrefetchFileBatchReaderImpl::NextBatchW
                 }
             }
         } else {
-            std::this_thread::sleep_for(std::chrono::microseconds(1));
+            // Some prefetch queue has no batch yet; block until a producer makes progress instead
+            // of busy-polling. The predicate mirrors the conditions the loop re-checks on wakeup:
+            // shutdown, a read error, or every queue holding at least one batch (a finished reader
+            // always leaves its EOF batch queued, so a non-empty queue means progress is possible).
+            std::unique_lock<std::mutex> lock(working_mutex_);
+            cv_.wait(lock, [this] {
+                if (is_shutdown_ || has_read_error_.load()) {
+                    return true;
+                }
+                for (const auto& prefetch_queue : prefetch_queues_) {
+                    if (prefetch_queue->empty()) {
+                        return false;
+                    }
+                }
+                return true;
+            });
         }
     }
 }
@@ -656,6 +682,7 @@ uint64_t PrefetchFileBatchReaderImpl::GetNextRowToRead() const {
 void PrefetchFileBatchReaderImpl::SetReadStatus(const Status& status) {
     std::unique_lock<std::shared_mutex> lock(rw_mutex_);
     read_status_ = status;
+    has_read_error_.store(!status.ok());
 }
 
 Status PrefetchFileBatchReaderImpl::GetReadStatus() const {

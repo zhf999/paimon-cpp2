@@ -167,6 +167,10 @@ class PrefetchFileBatchReaderImpl : public PrefetchFileBatchReader {
     mutable std::shared_mutex rw_mutex_;
     std::unique_ptr<std::thread> background_thread_;
     Status read_status_;
+    // Mirrors whether read_status_ currently holds an error. Kept as an atomic so the consumer's
+    // condition-variable predicate can observe read errors without taking rw_mutex_ while holding
+    // working_mutex_ (which would invert the lock order used by SetReadStatus/GetReadStatus).
+    std::atomic<bool> has_read_error_ = false;
     std::atomic<bool> is_shutdown_ = false;
     std::vector<uint64_t> current_batch_global_row_ids_;
     bool need_prefetch_ = false;
