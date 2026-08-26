@@ -98,7 +98,7 @@ class ReadContextBuilder::Impl {
         predicate_.reset();
         enable_predicate_filter_ = false;
         enable_prefetch_ = false;
-        enable_late_materializing_ = false;
+        enable_late_materializing_ = true;
         read_ahead_cache_enabled_ = true;
         prefetch_batch_count_ = 600;
         prefetch_max_parallel_num_ = 3;
@@ -124,7 +124,7 @@ class ReadContextBuilder::Impl {
     std::shared_ptr<Predicate> predicate_;
     bool enable_predicate_filter_ = false;
     bool enable_prefetch_ = false;
-    bool enable_late_materializing_ = false;
+    bool enable_late_materializing_ = true;
     uint32_t prefetch_batch_count_ = 600;
     uint32_t prefetch_max_parallel_num_ = 3;
     bool enable_multi_thread_row_to_batch_ = false;
